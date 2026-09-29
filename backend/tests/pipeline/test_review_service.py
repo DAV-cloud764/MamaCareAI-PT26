@@ -15,6 +15,7 @@ from backend.modules.pipeline.domain.enums import (
     SourceType,
     VersionAuthorKind,
 )
+from backend.modules.pipeline.domain.errors import InvalidStateTransition
 from backend.modules.pipeline.domain.models import (
     ContentVersion,
     NormalizedDocument,
@@ -136,6 +137,18 @@ def test_second_edit_creates_version_3() -> None:
 
 
 def test_concurrent_edits_do_not_collide_on_version_number() -> None:
+    """Two reviewers editing the same version at once: one lands, one is refused.
+
+    This test used to assert that BOTH concurrent edits succeeded with distinct
+    version numbers, and to read that as the guarantee. It is the opposite — it
+    is the blind-update behaviour the persistence layer is supposed to prevent.
+    With both writes landing, the second edit silently discards the first, and
+    because versions are append-only, nothing downstream would ever reveal it:
+    both versions exist, both are readable, and the wrong one is the latest.
+
+    The version-number concern that gave the test its name still holds, so it is
+    still asserted. There is simply one human version now instead of two.
+    """
     resources = ConcurrentReadResourceRepository()
     reviews, versions = ReviewRepo(), VersionRepo()
     resources.add(_resource("r1", ResourceStatus.NEEDS_EDIT))
@@ -152,14 +165,23 @@ def test_concurrent_edits_do_not_collide_on_version_number() -> None:
         queue=FakeJobQueue(),
     )
 
-    def submit(item: ReviewAssignment) -> ContentVersion:
+    def submit(item: ReviewAssignment) -> str:
         assert item.reviewer_id
-        return service.submit_edit(assignment_id=item.assignment_id, reviewer_id=item.reviewer_id, edited_units=_edits(item.reviewer_id))
+        try:
+            service.submit_edit(
+                assignment_id=item.assignment_id,
+                reviewer_id=item.reviewer_id,
+                edited_units=_edits(item.reviewer_id),
+            )
+        except InvalidStateTransition:
+            return "refused"
+        return "accepted"
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        created = list(pool.map(submit, (first, second)))
-    assert len({v.version_number for v in created}) == 2
-    assert [v.version_number for v in versions.list_versions("r1")] == [1, 2, 3]
+        outcomes = list(pool.map(submit, (first, second)))
+
+    assert sorted(outcomes) == ["accepted", "refused"]
+    assert [v.version_number for v in versions.list_versions("r1")] == [1, 2]
 
 
 def test_claim_next_returns_highest_priority_first() -> None:

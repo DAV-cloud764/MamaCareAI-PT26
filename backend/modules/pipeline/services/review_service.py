@@ -90,7 +90,7 @@ class ReviewService:
         if resource.status == ResourceStatus.STORED:
             assert_can_transition(resource.status, ResourceStatus.IN_REVIEW)
             updated = resource.with_status(ResourceStatus.IN_REVIEW)
-            self._resources.save(updated)
+            self._resources.save(updated, expected_status=resource.status)
             self._append_audit(
                 resource=resource,
                 reviewer_id=reviewer_id,
@@ -174,7 +174,7 @@ class ReviewService:
                 "language_confirmed_by": reviewer_id,
             },
         )
-        self._resources.save(updated)
+        self._resources.save(updated, expected_status=resource.status)
         self._reviews.append_audit(
             AuditEvent(
                 event_id=str(uuid.uuid4()),
@@ -203,11 +203,34 @@ class ReviewService:
         edited_units: list[TranslationUnit],
         note: str | None = None,
     ) -> ContentVersion:
-        """Save a reviewer's corrections as a new version."""
+        """Save a reviewer's corrections as a new version.
+
+        The resource transition is committed BEFORE the version is appended,
+        and that order is load-bearing. Doing it the other way round means a
+        losing concurrent edit has already written its version by the time the
+        conditional update refuses it, leaving an orphaned version that no
+        status ever points at and no reviewer can see. Since versions are
+        append-only, that orphan is permanent.
+
+        The two writes are still not one transaction, so the reverse is
+        possible: the transition lands and the version write then fails,
+        leaving the resource in EDITED with nothing new to review. That failure
+        is visible — EDITED has no outgoing transition, so the next attempt
+        fails the state machine loudly — whereas a silent orphan is not. A
+        single unit of work spanning both repositories is the proper fix and
+        belongs with the persistence factory.
+        """
         self._require_reviewer_id(reviewer_id)
         assignment = self._owned_assignment(assignment_id, reviewer_id)
         resource = self._resources.get(assignment.resource_id)
         assert_can_transition(resource.status, ResourceStatus.EDITED)
+
+        # Claim the transition first. If a concurrent edit got here first, this
+        # raises and nothing has been written.
+        self._resources.save(
+            resource.with_status(ResourceStatus.EDITED),
+            expected_status=resource.status,
+        )
 
         previous = self._versions.get_latest(resource.resource_id)
         next_number = 1 if previous is None else previous.version_number + 1
@@ -235,9 +258,6 @@ class ReviewService:
                 f"Version repository did not persist edit {candidate.version_id}"
             )
 
-        updated = resource.with_status(ResourceStatus.EDITED)
-        self._resources.save(updated)
-
         machine = self._versions.get_machine_version(resource.resource_id)
         differences = self._calculate_differences(machine, saved)
         self._append_audit(
@@ -253,7 +273,9 @@ class ReviewService:
                 "differences": differences,
             },
         )
-        self._reindex(updated, saved)
+        self._reindex(
+            self._resources.get(resource.resource_id), saved
+        )
         return saved
 
     def submit_decision(
@@ -294,7 +316,7 @@ class ReviewService:
             changes["last_error"] = note
 
         updated = resource.with_status(target, **changes)
-        self._resources.save(updated)
+        self._resources.save(updated, expected_status=resource.status)
 
         completed_at = None
         if decision in {ReviewDecision.APPROVE, ReviewDecision.REJECT}:

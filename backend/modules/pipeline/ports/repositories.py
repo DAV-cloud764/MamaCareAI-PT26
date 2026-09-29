@@ -49,16 +49,31 @@ class ResourceRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def save(self, resource: Resource) -> None:
-        """Persist an updated resource.
+    def save(self, resource: Resource, *, expected_status: ResourceStatus) -> None:
+        """Persist an updated resource, conditional on the status it replaces.
 
-        TODO (IMPORTANT — concurrency): implement this as an optimistic
-        conditional update, i.e.
-            UPDATE resources SET status=:new WHERE id=:id AND status=:expected
-        and raise `InvalidStateTransition` when zero rows are affected. A blind
-        UPDATE lets two workers overwrite each other's status and a resource
-        silently skips a stage. This is the single most important line of
-        correctness in the persistence layer.
+        A blind UPDATE lets two workers overwrite each other: both load a
+        resource in the same status, both finish their work, both write, and
+        the second write erases the first. The resource then skips a stage and
+        nothing anywhere reports a problem — the row exists, its status is
+        legal, and its content is simply wrong. This is the single most
+        important line of correctness in the persistence layer.
+
+        `expected_status` is the status the caller READ, not the one it is
+        writing. A repository cannot recover it: re-reading the row would make
+        the comparison match by construction, and a check that can never fail
+        is not a check. So the caller states what it saw, and the UPDATE carries
+        that in its WHERE clause:
+
+            UPDATE resources SET ... WHERE resource_id = :id AND status = :expected
+
+        Raise `InvalidStateTransition` when no row matches. It is a
+        `PermanentError`, so `Stage.run` dead-letters the job rather than
+        replaying a write that is certain to lose again.
+
+        Every legal transition in `ALLOWED_TRANSITIONS` changes the status —
+        there are no self-loops — which is what makes status a sufficient
+        compare-and-swap token here.
         """
         raise NotImplementedError
 
