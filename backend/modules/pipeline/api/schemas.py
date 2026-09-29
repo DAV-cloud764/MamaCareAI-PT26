@@ -110,6 +110,7 @@ class UnitSchema(BaseModel):
     order: int
     source_text: str
     translated_text: str
+    kind: str = "paragraph"
     confidence: float | None = None
 
 
@@ -126,7 +127,23 @@ class ReviewPayloadResponse(BaseModel):
 
 class EditRequest(BaseModel):
     units: list[UnitSchema]
+    base_version_number: int = Field(ge=1)
     note: str | None = None
+
+    @field_validator("units")
+    @classmethod
+    def validate_units(cls, units: list[UnitSchema]) -> list[UnitSchema]:
+        if not units:
+            raise ValueError("an edit must contain at least one unit")
+
+        orders = [unit.order for unit in units]
+        if len(set(orders)) != len(orders):
+            duplicates = sorted({o for o in orders if orders.count(o) > 1})
+            raise ValueError(f"duplicate unit order(s): {duplicates}")
+        if orders != sorted(orders):
+            raise ValueError("units must be in ascending order")
+
+        return units
 
 
 class DecisionRequest(BaseModel):
@@ -177,11 +194,17 @@ class DecisionRequest(BaseModel):
 #
 # EditRequest
 #     units: list[UnitSchema]    (order + edited translated_text)
+#     base_version_number: int   the version the reviewer was looking at
 #     note: str | None
-#     TODO: validate that `order` values match the existing version's orders
-#           exactly. A client sending a block that does not exist, or silently
-#           dropping one, would corrupt the alignment the whole review UI and
-#           the feedback loop depend on.
+#     DONE: intrinsic validation — non-empty, unique orders, ascending.
+#     NOT DONE, and deliberately not here: comparing the submitted orders
+#     against the STORED version's orders, and checking base_version_number
+#     against current state. A Pydantic model has no database access, so it
+#     cannot know what the stored version looks like. That check belongs in
+#     `VersionRepository.save_version_if_current` (raises StaleVersionError)
+#     called from `ReviewService.submit_edit`, which the API maps to 409.
+#     Splitting it this way is the point: the schema rejects a malformed
+#     request, the repository rejects a stale one.
 #
 # DecisionRequest
 #     decision: ReviewDecision

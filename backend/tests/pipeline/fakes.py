@@ -18,6 +18,7 @@ from backend.modules.pipeline.domain.enums import (
 from backend.modules.pipeline.domain.errors import (
     ExtractionError,
     FetchError,
+    StaleVersionError,
     UnsupportedSourceType,
 )
 from backend.modules.pipeline.domain.models import (
@@ -152,6 +153,24 @@ class FakeVersionRepository(VersionRepository):
             note=version.note,
         )
         self._versions[version.resource_id].append(updated_version)
+
+    def save_version_if_current(
+        self, version: ContentVersion, *, base_version_number: int
+    ) -> ContentVersion:
+        current = self.get_latest(version.resource_id)
+        current_number = current.version_number if current is not None else 0
+        if current_number != base_version_number:
+            raise StaleVersionError(
+                f"Resource {version.resource_id} is at version {current_number}, "
+                f"not {base_version_number}",
+                resource_id=version.resource_id,
+                base_version_number=base_version_number,
+                current_version_number=current_number,
+            )
+        self.save_version(version)
+        saved = self.get_latest(version.resource_id)
+        assert saved is not None
+        return saved
 
     def get_latest(self, resource_id: str) -> ContentVersion | None:
         versions = self._versions.get(resource_id, [])
