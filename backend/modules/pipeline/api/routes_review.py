@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from ..container import Container
 from ..domain.enums import ResourceStatus, ReviewDecision, VersionAuthorKind
+from ..domain.errors import InvalidStateTransition, StaleVersionError
 from ..domain.models import (
     ContentVersion,
     NormalizedDocument,
@@ -76,7 +77,6 @@ def get_review_service(
         versions=container.versions,
         documents=container.documents,
         queue=container.queue,
-        search=container.search,
     )
 
 
@@ -205,6 +205,7 @@ def submit_edit(
             order=unit.order,
             source_text=unit.source_text,
             translated_text=unit.translated_text,
+            kind=unit.kind,
             confidence=unit.confidence,
         )
         for unit in payload.units
@@ -214,10 +215,29 @@ def submit_edit(
             assignment_id=assignment_id,
             reviewer_id=user.user_id,
             edited_units=units,
+            base_version_number=payload.base_version_number,
             note=payload.note,
         )
+    except StaleVersionError as exc:
+        # 409, not 500. The reviewer did nothing wrong — their tab went stale
+        # while they were typing, which is the normal case for two reviewers on
+        # one document. Tell them how far behind they are so the UI can offer a
+        # reload, rather than showing a generic failure.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(exc),
+                "base_version_number": exc.base_version_number,
+                "current_version_number": exc.current_version_number,
+            },
+        ) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except InvalidStateTransition as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     return {"version_number": version.version_number}
 
 
