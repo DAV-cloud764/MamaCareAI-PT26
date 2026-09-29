@@ -9,7 +9,6 @@ from threading import Barrier, Lock
 from typing import cast
 
 import pytest
-
 from backend.modules.pipeline.domain.enums import (
     ResourceStatus,
     ReviewDecision,

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import pytest
+
 from modules.pipeline.adapters.translation.chunker import Chunk, Chunker
 from modules.pipeline.domain.enums import ResourceStatus, SourceType, VersionAuthorKind
 from modules.pipeline.domain.errors import TranslationError

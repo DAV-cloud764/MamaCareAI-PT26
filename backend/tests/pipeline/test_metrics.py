@@ -5,7 +5,6 @@ from __future__ import annotations
 import uuid
 
 import pytest
-
 from backend.modules.pipeline.container import build_test_container
 from backend.modules.pipeline.domain.enums import ResourceStatus, SourceType
 from backend.modules.pipeline.domain.errors import PermanentError, TransientError

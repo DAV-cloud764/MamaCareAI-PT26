@@ -6,6 +6,9 @@ from datetime import UTC, datetime
 from typing import cast
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from modules.pipeline.adapters.storage.sql_repositories import (
     AssignmentNotFoundError,
     AuditEvent,
@@ -28,8 +31,6 @@ from modules.pipeline.adapters.storage.sql_repositories import (
     TranslationUnit,
     UnauthorizedAssignmentAccessError,
 )
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
 
 @pytest.fixture

@@ -1,6 +1,7 @@
 """Tests for FastTextDetector."""
 
 import pytest
+
 from modules.pipeline.adapters.language.fasttext_detector import FastTextDetector
 from modules.pipeline.ports.language_detector import DetectionResult
 
