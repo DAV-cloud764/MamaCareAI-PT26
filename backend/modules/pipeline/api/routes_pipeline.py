@@ -16,12 +16,15 @@ endpoint that fetches arbitrary URLs is an open proxy, and someone will find it.
 from __future__ import annotations
 
 from hashlib import sha256
+from os import getenv
+from secrets import compare_digest
 from typing import Annotated
 from uuid import uuid4
 
 from fastapi import (
     APIRouter,
     Depends,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -43,7 +46,36 @@ from .schemas import (
     SubmitResponse,
 )
 
-router = APIRouter(prefix="/pipeline", tags=["pipeline"])
+
+def require_pipeline_api_key(
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+) -> None:
+    """Require the shared API key before accessing pipeline routes."""
+    expected = getenv("PIPELINE_API_KEY")
+
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "pipeline_auth_not_configured",
+                "message": "Pipeline authentication is not configured",
+            },
+        )
+
+    if x_api_key is None or not compare_digest(x_api_key, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "pipeline_auth_invalid",
+                "message": "Missing or invalid pipeline API key",
+            },
+        )
+
+router = APIRouter(
+    prefix="/pipeline",
+    tags=["pipeline"],
+    dependencies=[Depends(require_pipeline_api_key)],
+)
 
 
 def get_container(request: Request) -> Container:
