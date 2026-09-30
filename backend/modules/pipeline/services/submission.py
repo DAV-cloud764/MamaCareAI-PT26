@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
 from ..domain.enums import ResourceStatus, SourceType
@@ -44,6 +44,41 @@ class SubmissionService:
         self._resources = resources
         self._queue = queue
         self._source_register = source_register
+
+    @staticmethod
+    def _normalize_url(source_url: str) -> str:
+        """Return a canonical URL for duplicate checking and storage."""
+        parsed = urlparse(source_url)
+
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+
+        netloc = hostname
+
+        if parsed.username is not None:
+            userinfo = parsed.username
+            if parsed.password is not None:
+                userinfo = f"{userinfo}:{parsed.password}"
+            netloc = f"{userinfo}@{netloc}"
+
+        if parsed.port is not None:
+            is_default_port = (
+                (scheme == "http" and parsed.port == 80)
+                or (scheme == "https" and parsed.port == 443)
+            )
+            if not is_default_port:
+                netloc = f"{netloc}:{parsed.port}"
+
+        return urlunparse(
+            (
+                scheme,
+                netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                "",
+            )
+        )
 
     @staticmethod
     def _validate_url(source_url: str) -> None:
@@ -165,6 +200,8 @@ class SubmissionService:
         metadata: dict[str, object] | None = None,
     ) -> Resource:
         """Accept a resource for processing and return its record."""
+
+        source_url = self._normalize_url(source_url)
 
         # 1. Validate URL and SSRF constraints.
         self._validate_url(source_url)
