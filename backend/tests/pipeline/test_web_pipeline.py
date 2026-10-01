@@ -4,13 +4,6 @@ import socket
 
 import httpx
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-from modules.pipeline.adapters.fetchers.web_fetcher import WebFetcher
-from modules.pipeline.domain.enums import ResourceStatus, SourceType
-from modules.pipeline.domain.errors import PermanentError
-from modules.pipeline.domain.models import Job
-
 from backend.modules.pipeline.adapters.extractors.html_extractor import HtmlExtractor
 from backend.modules.pipeline.api.routes_pipeline import router
 from backend.modules.pipeline.container import build_test_container
@@ -29,6 +22,13 @@ from backend.tests.pipeline.fakes import (
     FakeReviewRepository,
     make_resource,
 )
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from modules.pipeline.adapters.fetchers.web_fetcher import WebFetcher
+from modules.pipeline.domain.enums import ResourceStatus, SourceType
+from modules.pipeline.domain.errors import PermanentError
+from modules.pipeline.domain.models import Job
 
 
 def make_fetcher(

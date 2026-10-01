@@ -6,7 +6,6 @@ import json
 
 import httpx
 import pytest
-
 from backend.modules.pipeline.adapters.translation.gemini_translator import (
     GeminiTranslator,
 )

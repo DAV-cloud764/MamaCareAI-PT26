@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+
 from modules.pipeline.adapters.fetchers.web_fetcher import WebFetcher
 from modules.pipeline.domain.errors import (
     FetchError,
