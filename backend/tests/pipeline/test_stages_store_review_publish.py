@@ -20,8 +20,12 @@ What is covered, per the plan:
 
 from __future__ import annotations
 
+import pytest
+
 from modules.pipeline.domain.enums import ResourceStatus, SourceType, VersionAuthorKind
+from modules.pipeline.domain.errors import InvalidStateTransition, TransientError
 from modules.pipeline.domain.models import (
+    AuditEvent,
     ContentVersion,
     NormalizedDocument,
     Resource,
@@ -47,6 +51,12 @@ class FakeVersionRepository:
     def get_latest(self, resource_id: str) -> ContentVersion | None:
         versions = self._by_resource.get(resource_id, [])
         return max(versions, key=lambda v: v.version_number) if versions else None
+
+    def list_versions(self, resource_id: str) -> list[ContentVersion]:
+        """Needed to resolve a pinned `approved_version_id` back to a version."""
+        return sorted(
+            self._by_resource.get(resource_id, []), key=lambda v: v.version_number
+        )
 
 
 class FakeDocumentRepository:
@@ -142,7 +152,11 @@ class FakeJobQueue:
 
 
 class FakeReviewRepository:
-    pass
+    def __init__(self) -> None:
+        self.audit: list[AuditEvent] = []
+
+    def append_audit(self, event: AuditEvent) -> None:
+        self.audit.append(event)
 
 
 # --- builders ----------------------------------------------------------------
@@ -226,10 +240,35 @@ def build_publish_stage(**overrides) -> tuple[PublishStage, FakeSearchIndex]:
     return stage, search
 
 
+def approved_resource(*, version_number: int = 1, **overrides) -> Resource:
+    """An APPROVED resource whose approval is pinned to a specific version.
+
+    `PublishStage` publishes the version approval named, not the newest one.
+    Every publish test therefore has to say which version was approved — which
+    is the point: a test that forgot to pin one would otherwise be quietly
+    asserting that "whatever is newest" is good enough to publish.
+    """
+    metadata = {
+        "approved_by": "reviewer-7",
+        "approved_version_id": f"vr1-{version_number}",
+        "approved_version_number": version_number,
+    }
+    metadata.update(overrides.pop("source_metadata", None) or {})
+    return make_resource(
+        status=ResourceStatus.APPROVED, source_metadata=metadata, **overrides
+    )
+
+
 # --- store stage -------------------------------------------------------------
 
 
-def test_store_indexes_versioned_path_and_opens_one_assignment() -> None:
+def test_store_does_not_index_and_opens_one_assignment() -> None:
+    """Store must not write to the index.
+
+    It used to, and `ReviewService` re-indexed on every edit, so unapproved
+    content reached the production index twice before a human had looked at it.
+    `PublishStage` is the only writer now.
+    """
     versions = FakeVersionRepository()
     versions.save_version(make_version(resource_id="r1", version_number=1))
     stage, search, review_service = build_store_stage(versions=versions)
@@ -240,15 +279,23 @@ def test_store_indexes_versioned_path_and_opens_one_assignment() -> None:
 
     assert result.next_status == ResourceStatus.STORED
     assert result.next_stage == "review"
-    indexed = search.indexed["r1"]
-    assert indexed.translated_text == "translated"
-    assert indexed.version_number == 1
-    assert indexed.status == "stored"
+    assert search.indexed == {}
     assert len(review_service.calls) == 1
     assert len(review_service.assignments) == 1
+    # The existing machine version is what the reviewer is asked to check.
+    _resource, handed_version = review_service.calls[0]
+    assert handed_version is not None
+    assert handed_version.version_number == 1
 
 
-def test_store_already_swahili_path_indexes_document_directly() -> None:
+def test_store_builds_a_reviewable_version_for_native_swahili() -> None:
+    """A source that is already Swahili still needs a version to review.
+
+    There was no machine translation, so the old code built a flattened string
+    inline and indexed it. Nothing reviewable was persisted, so a reviewer
+    opened the document to an empty right pane with no way to record what they
+    had checked.
+    """
     documents = FakeDocumentRepository()
     documents.save_document(make_document())
     versions = FakeVersionRepository()  # deliberately empty: no MT version
@@ -259,11 +306,19 @@ def test_store_already_swahili_path_indexes_document_directly() -> None:
     result = stage.handle(make_resource(status=ResourceStatus.LANGUAGE_DETECTED))
 
     assert result.next_status == ResourceStatus.STORED
-    indexed = search.indexed["r1"]
-    assert indexed.title == "Already-Swahili title"
-    assert "Habari za afya ya mama" in indexed.translated_text
-    assert indexed.version_number == 0
-    assert len(review_service.assignments) == 1
+    assert search.indexed == {}
+
+    _resource, version = review_service.calls[0]
+    assert version is not None
+    assert version.version_number == 1
+    assert version.author_kind is VersionAuthorKind.MACHINE
+    assert version.engine == "source:already-target-language"
+    # Aligned with the source blocks by `order`, so the review UI can render
+    # both panes the same way it does for translated content.
+    assert [unit.order for unit in version.units] == [0, 1]
+    assert version.units[0].source_text == "Habari za afya ya mama."
+    assert version.units[0].translated_text == "Habari za afya ya mama."
+    assert version.units[0].kind == "paragraph"
 
 
 def test_store_handle_running_twice_does_not_double_the_review_assignments() -> None:
@@ -303,7 +358,7 @@ def test_publish_stage_blocks_on_compliance_failure_and_never_publishes() -> Non
     versions.save_version(make_version())
     stage, search = build_publish_stage(compliance=compliance, versions=versions)
 
-    result = stage.handle(make_resource(status=ResourceStatus.APPROVED))
+    result = stage.handle(approved_resource(version_number=1))
 
     assert result.next_status == ResourceStatus.BLOCKED_LICENSING
     assert result.next_stage is None
@@ -317,12 +372,7 @@ def test_publish_stage_publishes_the_latest_version_not_version_one() -> None:
     versions.save_version(make_version(version_number=2, text="human-edited"))
     stage, search = build_publish_stage(versions=versions)
 
-    result = stage.handle(
-        make_resource(
-            status=ResourceStatus.APPROVED,
-            source_metadata={"approved_by": "reviewer-7"},
-        )
-    )
+    result = stage.handle(approved_resource(version_number=2))
 
     assert result.next_status == ResourceStatus.PUBLISHED
     indexed = search.indexed["r1"]
@@ -336,15 +386,130 @@ def test_publish_stage_records_who_approved_and_which_version() -> None:
     versions.save_version(make_version(version_number=2, text="approved"))
     stage, _search = build_publish_stage(versions=versions)
 
-    result = stage.handle(
-        make_resource(
-            status=ResourceStatus.APPROVED,
-            source_metadata={"approved_by": "reviewer-7"},
-        )
-    )
+    result = stage.handle(approved_resource(version_number=2))
 
     assert result.details["approved_by"] == "reviewer-7"
     assert result.details["approved_version"] == 2
+
+
+def test_publish_stage_publishes_the_version_approval_named_not_the_newest() -> None:
+    """Approval pins a version; publishing "whatever is newest" is not that.
+
+    Version 1 was approved. Version 2 was then appended by something else — a
+    stray edit, a retried job, a second tab. Publishing `get_latest()` would put
+    content in the production index that no human ever approved, while the
+    review UI still showed an approved-looking document.
+    """
+    versions = FakeVersionRepository()
+    versions.save_version(make_version(version_number=1, text="the approved one"))
+    versions.save_version(make_version(version_number=2, text="never approved"))
+    stage, search = build_publish_stage(versions=versions)
+
+    result = stage.handle(approved_resource(version_number=1))
+
+    assert result.next_status == ResourceStatus.PUBLISHED
+    indexed = search.indexed["r1"]
+    assert indexed.version_number == 1
+    assert indexed.translated_text == "the approved one"
+
+
+def test_publish_stage_refuses_a_resource_with_no_pinned_approval() -> None:
+    """No approved version recorded means nothing is authorised to publish.
+
+    This used to fall back to the newest version, which is how an unapproved
+    document could reach the index. It now refuses instead.
+    """
+    versions = FakeVersionRepository()
+    versions.save_version(make_version(version_number=1, text="unreviewed"))
+    stage, search = build_publish_stage(versions=versions)
+
+    with pytest.raises(InvalidStateTransition, match="no.*approved version"):
+        stage.handle(make_resource(status=ResourceStatus.APPROVED))
+
+    assert search.indexed == {}
+
+
+def test_publish_stage_records_an_audit_event_for_the_transition() -> None:
+    """Every action writes an audit event; publication was not doing that.
+
+    `ComplianceGate` documents that every evaluation, pass or fail, must be
+    recorded by the calling stage. Publication recorded neither its own
+    transition nor its own gate result.
+    """
+    reviews = FakeReviewRepository()
+    versions = FakeVersionRepository()
+    versions.save_version(make_version(version_number=1, text="approved"))
+    stage = PublishStage(
+        resources=FakeResourceRepository(),
+        queue=FakeJobQueue(),
+        reviews=reviews,
+        versions=versions,
+        search=FakeSearchIndex(),
+        compliance_gate=FakeComplianceGate(allowed=True),
+    )
+
+    stage.handle(approved_resource(version_number=1))
+
+    assert [event.action for event in reviews.audit] == ["publish"]
+    event = reviews.audit[0]
+    assert event.actor_id == "system:publish"
+    assert event.from_status is ResourceStatus.APPROVED
+    assert event.to_status is ResourceStatus.PUBLISHED
+    assert event.details["approved_version"] == 1
+
+
+def test_a_blocked_publication_is_audited_too() -> None:
+    """A refusal is exactly the kind of decision a later reader needs."""
+    reviews = FakeReviewRepository()
+    versions = FakeVersionRepository()
+    versions.save_version(make_version(version_number=1, text="blocked"))
+    stage = PublishStage(
+        resources=FakeResourceRepository(),
+        queue=FakeJobQueue(),
+        reviews=reviews,
+        versions=versions,
+        search=FakeSearchIndex(),
+        compliance_gate=FakeComplianceGate(allowed=False, reason="unknown licence"),
+    )
+
+    stage.handle(approved_resource(version_number=1))
+
+    assert [event.action for event in reviews.audit] == ["publish_blocked"]
+    assert reviews.audit[0].to_status is ResourceStatus.BLOCKED_LICENSING
+    assert reviews.audit[0].details["reason"] == "unknown licence"
+
+
+def test_a_failed_handoff_publishes_nothing_and_is_retriable() -> None:
+    """The handoff runs BEFORE the index write, and failure is retriable.
+
+    It used to run after, while its own comment said it should not fail the
+    publish — so a handoff error raised after the index was already mutated,
+    leaving the resource in APPROVED with a PUBLISHED index entry. Two
+    subsystems disagreeing about one document, with nothing to reconcile them.
+    """
+    class BrokenHandoff:
+        def handoff_published_content(self, **kwargs) -> None:
+            raise RuntimeError("knowledge module unavailable")
+
+    reviews = FakeReviewRepository()
+    versions = FakeVersionRepository()
+    versions.save_version(make_version(version_number=1, text="never indexed"))
+    search = FakeSearchIndex()
+    stage = PublishStage(
+        resources=FakeResourceRepository(),
+        queue=FakeJobQueue(),
+        reviews=reviews,
+        versions=versions,
+        search=search,
+        compliance_gate=FakeComplianceGate(allowed=True),
+        knowledge_handoff=BrokenHandoff(),
+    )
+
+    with pytest.raises(TransientError):
+        stage.handle(approved_resource(version_number=1))
+
+    assert search.indexed == {}
+    assert reviews.audit == []
 
 
 # --- knowledge handoff tests (PIPE-32) --------------------------------------
@@ -358,9 +523,9 @@ def test_knowledge_handoff_called_when_configured() -> None:
     stage, _search = build_publish_stage(versions=versions, knowledge=knowledge)
 
     result = stage.handle(
-        make_resource(
-            status=ResourceStatus.APPROVED,
-            source_metadata={"approved_by": "reviewer-7", "title": "Test Title"},
+        approved_resource(
+            version_number=2,
+            source_metadata={"title": "Test Title"},
             detected_language="sw",
         )
     )
@@ -387,8 +552,8 @@ def test_knowledge_handoff_receives_correct_data_structure() -> None:
     )
     stage = build_publish_stage(versions=versions, knowledge=knowledge)[0]
 
-    resource = make_resource(
-        status=ResourceStatus.APPROVED,
+    resource = approved_resource(
+        version_number=3,
         source_url="https://health.gov/swahili-guide",
         source_metadata={
             "approved_by": "reviewer-8",
@@ -417,12 +582,7 @@ def test_knowledge_handoff_not_called_when_not_configured() -> None:
     versions.save_version(make_version(version_number=1, text="text"))
     stage, search = build_publish_stage(versions=versions, knowledge=None)
 
-    result = stage.handle(
-        make_resource(
-            status=ResourceStatus.APPROVED,
-            source_metadata={"approved_by": "reviewer-7"},
-        )
-    )
+    result = stage.handle(approved_resource(version_number=1))
 
     assert result.next_status == ResourceStatus.PUBLISHED
     assert result.details["knowledge_handoff"] is False
@@ -439,12 +599,7 @@ def test_knowledge_handoff_with_version_management() -> None:
     versions.save_version(make_version(version_number=2, text="human edited"))
     stage, _search = build_publish_stage(versions=versions, knowledge=knowledge)
 
-    result = stage.handle(
-        make_resource(
-            status=ResourceStatus.APPROVED,
-            source_metadata={"approved_by": "reviewer-7"},
-        )
-    )
+    result = stage.handle(approved_resource(version_number=2))
 
     # Should handoff version 2 (human edited), not version 1
     assert knowledge.handoffs[0]["version_number"] == 2
@@ -460,10 +615,7 @@ def test_knowledge_handoff_preserves_search_index_functionality() -> None:
     stage, search = build_publish_stage(versions=versions, knowledge=knowledge)
 
     result = stage.handle(
-        make_resource(
-            status=ResourceStatus.APPROVED,
-            source_metadata={"title": "Searchable Title"},
-        )
+        approved_resource(version_number=1, source_metadata={"title": "Searchable Title"})
     )
 
     # Both search index and knowledge handoff should work

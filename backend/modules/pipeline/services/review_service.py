@@ -11,6 +11,7 @@ from ..domain.enums import (
     ReviewDecision,
     VersionAuthorKind,
 )
+from ..domain.errors import StaleVersionError
 from ..domain.models import (
     AuditEvent,
     ContentVersion,
@@ -28,7 +29,6 @@ from ..ports.repositories import (
     ReviewRepository,
     VersionRepository,
 )
-from ..ports.search_index import IndexedResource, SearchIndex
 
 
 class ReviewService:
@@ -42,14 +42,12 @@ class ReviewService:
         versions: VersionRepository,
         documents: DocumentRepository,
         queue: JobQueue,
-        search: SearchIndex | None = None,
     ) -> None:
         self._resources = resources
         self._reviews = reviews
         self._versions = versions
         self._documents = documents
         self._queue = queue
-        self._search = search
 
     def enqueue_for_review(
         self, resource: Resource, version: ContentVersion | None
@@ -201,23 +199,35 @@ class ReviewService:
         assignment_id: str,
         reviewer_id: str,
         edited_units: list[TranslationUnit],
+        base_version_number: int,
         note: str | None = None,
     ) -> ContentVersion:
         """Save a reviewer's corrections as a new version.
 
-        The resource transition is committed BEFORE the version is appended,
-        and that order is load-bearing. Doing it the other way round means a
-        losing concurrent edit has already written its version by the time the
-        conditional update refuses it, leaving an orphaned version that no
-        status ever points at and no reviewer can see. Since versions are
-        append-only, that orphan is permanent.
+        `base_version_number` is the version the reviewer was looking at when
+        they started editing. It is checked twice, and both checks earn their
+        place:
 
-        The two writes are still not one transaction, so the reverse is
-        possible: the transition lands and the version write then fails,
-        leaving the resource in EDITED with nothing new to review. That failure
-        is visible — EDITED has no outgoing transition, so the next attempt
-        fails the state machine loudly — whereas a silent orphan is not. A
-        single unit of work spanning both repositories is the proper fix and
+          1. A read, BEFORE anything is written. This is the one the reviewer
+             experiences — a stale tab is refused cleanly, with the resource
+             left exactly as it was, so their reload shows them the truth
+             instead of a document stuck mid-transition.
+          2. `save_version_if_current`, which is the one that is actually safe.
+             The read above and the insert below are separate round trips, so
+             only the version repository's own check-and-insert, inside one
+             transaction, can be the authority.
+
+        The resource transition is committed before the version is appended.
+        That order is load-bearing: the other way round means a losing
+        concurrent edit has already written its version by the time the
+        conditional update refuses it, leaving an orphan that no status points
+        at and nothing can remove, since versions are append-only.
+
+        Residual gap, stated rather than hidden: the resource write and the
+        version write are not one transaction. If a third writer changes the
+        version between the resource transition landing and the insert, we
+        raise `StaleVersionError` with the resource in EDITED and no new
+        version. That needs a unit of work spanning both repositories, which
         belongs with the persistence factory.
         """
         self._require_reviewer_id(reviewer_id)
@@ -225,38 +235,27 @@ class ReviewService:
         resource = self._resources.get(assignment.resource_id)
         assert_can_transition(resource.status, ResourceStatus.EDITED)
 
-        # Claim the transition first. If a concurrent edit got here first, this
-        # raises and nothing has been written.
+        self._require_base_version(resource.resource_id, base_version_number)
+
+        # Claim the transition. If a concurrent edit got here first this
+        # raises, and nothing has been written.
         self._resources.save(
             resource.with_status(ResourceStatus.EDITED),
             expected_status=resource.status,
         )
 
-        previous = self._versions.get_latest(resource.resource_id)
-        next_number = 1 if previous is None else previous.version_number + 1
         candidate = ContentVersion(
             version_id=str(uuid.uuid4()),
             resource_id=resource.resource_id,
-            version_number=next_number,
+            version_number=base_version_number + 1,
             author_kind=VersionAuthorKind.HUMAN,
             author_id=reviewer_id,
             units=tuple(sorted(edited_units, key=lambda unit: unit.order)),
             note=note,
         )
-        self._versions.save_version(candidate)
-
-        saved = next(
-            (
-                version
-                for version in self._versions.list_versions(resource.resource_id)
-                if version.version_id == candidate.version_id
-            ),
-            None,
+        saved = self._versions.save_version_if_current(
+            candidate, base_version_number=base_version_number
         )
-        if saved is None:
-            raise RuntimeError(
-                f"Version repository did not persist edit {candidate.version_id}"
-            )
 
         machine = self._versions.get_machine_version(resource.resource_id)
         differences = self._calculate_differences(machine, saved)
@@ -273,10 +272,27 @@ class ReviewService:
                 "differences": differences,
             },
         )
-        self._reindex(
-            self._resources.get(resource.resource_id), saved
-        )
         return saved
+
+    def _require_base_version(
+        self, resource_id: str, base_version_number: int
+    ) -> None:
+        """Refuse a write based on a version that is no longer current.
+
+        Raised before anything is written, so a reviewer whose tab went stale
+        gets a clean conflict and a resource still in the state they left it.
+        """
+        latest = self._versions.get_latest(resource_id)
+        current = latest.version_number if latest is not None else 0
+        if current == base_version_number:
+            return
+        raise StaleVersionError(
+            f"Resource {resource_id!r} is at version {current}, not "
+            f"{base_version_number}. Reload the review and reapply your changes.",
+            resource_id=resource_id,
+            base_version_number=base_version_number,
+            current_version_number=current,
+        )
 
     def submit_decision(
         self,
@@ -308,9 +324,23 @@ class ReviewService:
 
         changes: dict[str, object] = {}
         if decision == ReviewDecision.APPROVE:
+            # Pin WHICH version was approved, not just who approved it.
+            # `PublishStage` used to publish `get_latest()`, which is only the
+            # approved version if nothing else was appended after the click.
+            # Any later write — a stray edit, a retried job — would then publish
+            # content no human ever approved, and the review UI would still
+            # show an approved-looking document. Pinning the id removes the
+            # assumption.
+            latest = self._versions.get_latest(resource.resource_id)
+            if latest is None:
+                raise ValueError(
+                    "Cannot approve a resource that has no content version"
+                )
             changes["source_metadata"] = {
                 **resource.source_metadata,
                 "approved_by": reviewer_id,
+                "approved_version_id": latest.version_id,
+                "approved_version_number": latest.version_number,
             }
         elif decision == ReviewDecision.REJECT:
             changes["last_error"] = note
@@ -426,20 +456,3 @@ class ReviewService:
                 }
             )
         return differences
-
-    def _reindex(self, resource: Resource, version: ContentVersion) -> None:
-        if self._search is None:
-            return
-        self._search.index(
-            IndexedResource(
-                resource_id=resource.resource_id,
-                title=resource.source_metadata.get("title"), # type: ignore
-                translated_text="\n\n".join(
-                    unit.translated_text for unit in version.units
-                ),
-                source_url=resource.source_url,
-                status=resource.status.value,
-                version_number=version.version_number,
-                metadata={"language": resource.detected_language or ""},
-            )
-        )
