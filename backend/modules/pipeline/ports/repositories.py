@@ -109,6 +109,32 @@ class VersionRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def save_version_if_current(
+        self, version: ContentVersion, *, base_version_number: int
+    ) -> ContentVersion:
+        """Insert `version` only if the resource is still at `base_version_number`.
+
+        This is the stale-write guard for the human review loop, and it is the
+        only thing standing between two reviewers' browsers and a silently
+        discarded edit. The reviewer loaded version N, spent ten minutes
+        correcting it, and submitted. Meanwhile a second reviewer, or the same
+        one in another tab, saved version N+1. Appending N+1 now would produce
+        a history where the second submission silently overwrites the first —
+        and because versions are append-only, nothing would ever reveal it.
+        Nothing downstream can detect the loss: both versions exist, both are
+        readable, and the wrong one is the latest.
+
+        So the check and the insert must be ONE statement against the current
+        state, inside one transaction. Reading the current version, comparing
+        it in Python, and then inserting is the same bug with more steps.
+
+        Raise `StaleVersionError` (a `PermanentError`, not retryable) when the
+        resource has moved on. The API layer maps that to 409 CONFLICT so the
+        reviewer is told to reload rather than shown a generic failure.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def get_latest(self, resource_id: str) -> ContentVersion | None:
         """Highest version number for a resource — what gets published."""
         raise NotImplementedError

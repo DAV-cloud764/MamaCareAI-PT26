@@ -5,6 +5,7 @@ from io import BytesIO
 
 import pymupdf
 import pytest
+
 from modules.pipeline.adapters.extractors.pdf_text_extractor import PdfTextExtractor
 from modules.pipeline.domain.errors import ExtractionError
 
