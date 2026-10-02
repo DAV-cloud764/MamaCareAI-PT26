@@ -20,9 +20,11 @@ every source in the knowledge base is traceable to a vetted register entry.
 
 from __future__ import annotations
 
+import uuid
+
 from ..domain.enums import ResourceStatus
-from ..domain.errors import InvalidStateTransition
-from ..domain.models import Resource
+from ..domain.errors import InvalidStateTransition, TransientError
+from ..domain.models import AuditEvent, ContentVersion, Resource
 from ..observability.metrics import Metrics
 from ..ports.job_queue import JobQueue
 from ..ports.repositories import ResourceRepository, ReviewRepository, VersionRepository
@@ -31,8 +33,16 @@ from ..services import ComplianceGate
 from .base import Stage, StageResult
 
 
-class KnowledgeHandoffError(Exception):
-    """Raised when knowledge handoff fails."""
+class KnowledgeHandoffError(TransientError):
+    """The knowledge module refused the published content.
+
+    Retriable on purpose. A handoff is a call to another service, and "that
+    service is briefly down" is exactly the case `TransientError` exists for —
+    `Stage.run` will re-queue with backoff. It used to subclass bare
+    `Exception`, which `base.py` treats as a bug and dead-letters on the first
+    failure, so one unavailable dependency permanently lost an approved
+    document.
+    """
 
 
 class PublishStage(Stage):
@@ -55,6 +65,7 @@ class PublishStage(Stage):
             resources=resources, queue=queue, reviews=reviews, max_attempts=max_attempts, metrics=metrics
         )
         self._versions = versions
+        self._reviews = reviews
         self._search = search
         self._compliance = compliance_gate
         self._knowledge_handoff = knowledge_handoff
@@ -68,34 +79,67 @@ class PublishStage(Stage):
         return frozenset({ResourceStatus.APPROVED})
 
     def handle(self, resource: Resource) -> StageResult:
-        """Check licensing, then publish the approved version.
+        """Check licensing, hand off, then publish the approved version.
 
-        Order is non-negotiable: the compliance gate runs FIRST, before anything
-        becomes visible. Then the LATEST version is published — that is the
-        human-edited one when a reviewer edited it. Publishing version 1
-        unconditionally would silently discard every human correction.
+        Order is non-negotiable, and the handoff now comes BEFORE the index
+        write. It used to come after, while its own comment said it should not
+        fail the publish — so a handoff error raised *after* the index had
+        already been mutated, leaving the resource in APPROVED with a PUBLISHED
+        index entry. Those two disagreed about the same document and nothing
+        reconciled them.
+
+        The version published is the one approval named, not the newest one.
+        `submit_decision` records `approved_version_id` at the moment of the
+        click; publishing `get_latest()` instead would be correct only for as
+        long as nothing else was appended afterwards.
         """
         decision = self._compliance.evaluate(resource)
         if not decision.allowed:
+            self._audit(
+                resource,
+                action="publish_blocked",
+                from_status=ResourceStatus.APPROVED,
+                to_status=ResourceStatus.BLOCKED_LICENSING,
+                details={"reason": decision.reason, "license_id": decision.license_id},
+            )
             return StageResult(
                 next_status=ResourceStatus.BLOCKED_LICENSING,
                 next_stage=None,
                 details={"reason": decision.reason},
             )
 
-        version = self._versions.get_latest(resource.resource_id)
-        if version is None:
-            raise InvalidStateTransition(
-                f"Resource {resource.resource_id} is APPROVED but has no "
-                "content version to publish",
-                resource_id=resource.resource_id,
-            )
+        version = self._approved_version(resource)
 
         translated_text = "\n\n".join(unit.translated_text for unit in version.units)
+        # `source_metadata` is a free-form bag, so this needs narrowing rather
+        # than trusting whatever the fetcher happened to put there.
+        raw_title = resource.source_metadata.get("title")
+        title = raw_title if isinstance(raw_title, str) else None
+
+        if self._knowledge_handoff is not None:
+            try:
+                self._knowledge_handoff.handoff_published_content(
+                    resource_id=resource.resource_id,
+                    source_url=resource.source_url,
+                    title=title,
+                    translated_text=translated_text,
+                    version_number=version.version_number,
+                    language=resource.detected_language or "",
+                    metadata=resource.source_metadata,
+                )
+            except Exception as exc:
+                # Raised BEFORE the index write, so a failed handoff leaves
+                # nothing published anywhere. `Stage.run` re-queues it.
+                raise KnowledgeHandoffError(
+                    f"Failed to hand off resource {resource.resource_id} to the "
+                    f"knowledge module: {exc}",
+                    resource_id=resource.resource_id,
+                ) from exc
+
         self._search.index(
             IndexedResource(
                 resource_id=resource.resource_id,
-                title=resource.source_metadata.get("title"),
+                title=title,
                 translated_text=translated_text,
                 source_url=resource.source_url,
                 status=ResourceStatus.PUBLISHED.value,
@@ -104,24 +148,17 @@ class PublishStage(Stage):
             )
         )
 
-        # Knowledge handoff (PIPE-32): Send to modules/knowledge for chunking and embedding
-        if self._knowledge_handoff is not None:
-            try:
-                self._knowledge_handoff.handoff_published_content(
-                    resource_id=resource.resource_id,
-                    source_url=resource.source_url,
-                    title=resource.source_metadata.get("title"),
-                    translated_text=translated_text,
-                    version_number=version.version_number,
-                    language=resource.detected_language or "",
-                    metadata=resource.source_metadata,
-                )
-            except Exception as e:
-                # Log the error but don't fail the publish - search index is more critical
-                # In production, this should be monitored and retried
-                raise KnowledgeHandoffError(
-                    f"Failed to handoff resource {resource.resource_id} to knowledge module: {e}"
-                ) from e
+        self._audit(
+            resource,
+            action="publish",
+            from_status=ResourceStatus.APPROVED,
+            to_status=ResourceStatus.PUBLISHED,
+            details={
+                "approved_version": version.version_number,
+                "approved_by": resource.source_metadata.get("approved_by"),
+                "knowledge_handoff": self._knowledge_handoff is not None,
+            },
+        )
 
         return StageResult(
             next_status=ResourceStatus.PUBLISHED,
@@ -131,4 +168,56 @@ class PublishStage(Stage):
                 "approved_by": resource.source_metadata.get("approved_by"),
                 "knowledge_handoff": self._knowledge_handoff is not None,
             },
+        )
+
+    def _approved_version(self, resource: Resource) -> ContentVersion:
+        """Resolve the version approval named, refusing if there is none.
+
+        Falling back to the newest version would reintroduce the bug this
+        replaces: "whatever happens to be latest" is not the same claim as
+        "a human approved this".
+        """
+        approved_id = resource.source_metadata.get("approved_version_id")
+        if isinstance(approved_id, str) and approved_id:
+            for version in self._versions.list_versions(resource.resource_id):
+                if version.version_id == approved_id:
+                    return version
+            raise InvalidStateTransition(
+                f"Resource {resource.resource_id} was approved at version "
+                f"{approved_id!r}, which is no longer retrievable.",
+                resource_id=resource.resource_id,
+            )
+
+        raise InvalidStateTransition(
+            f"Resource {resource.resource_id} is APPROVED but records no "
+            f"approved version, so there is nothing authorised to publish.",
+            resource_id=resource.resource_id,
+        )
+
+    def _audit(
+        self,
+        resource: Resource,
+        *,
+        action: str,
+        from_status: ResourceStatus,
+        to_status: ResourceStatus,
+        details: dict[str, object],
+    ) -> None:
+        """Append the audit row.
+
+        The module's own non-negotiable is that every action writes an audit
+        event, and `ComplianceGate` documents that every evaluation — pass or
+        fail — must be recorded by the calling stage. Publication was doing
+        neither.
+        """
+        self._reviews.append_audit(
+            AuditEvent(
+                event_id=str(uuid.uuid4()),
+                resource_id=resource.resource_id,
+                actor_id=f"system:{self.name}",
+                action=action,
+                from_status=from_status,
+                to_status=to_status,
+                details=details,
+            )
         )

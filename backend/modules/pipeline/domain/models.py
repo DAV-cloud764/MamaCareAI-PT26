@@ -131,10 +131,13 @@ class NormalizedDocument:
     def raw_text(self) -> str:
         """Flattened plain text. Convenience only — never persist this as the source of truth.
 
-        TODO: join blocks with "\\n\\n". Keep it a derived property so `blocks`
-        stays the single source of truth and the two can never drift apart.
+        Derived from `blocks` so the two can never drift apart. This is the
+        input language detection and search indexing consume, which is why a
+        blank line separates blocks: a detector reading "somesymptom" out of
+        two unrelated blocks joined without a gap would be reading text the
+        document never contained.
         """
-        raise NotImplementedError
+        return "\n\n".join(block.text for block in self.blocks)
 
 
 @dataclass(frozen=True, slots=True)

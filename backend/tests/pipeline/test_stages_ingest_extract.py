@@ -136,7 +136,7 @@ def test_ingest_extract_end_to_end():
         source_url="https://example.com/test",
         status=ResourceStatus.SUBMITTED,
     )
-    container["resources"].save(resource)
+    container["resources"].add(resource)
 
     # Run ingest stage
     ingest_job = Job(
@@ -207,7 +207,7 @@ def test_ingest_idempotency():
         source_url="https://example.com/test",
         status=ResourceStatus.SUBMITTED,
     )
-    container["resources"].save(resource)
+    container["resources"].add(resource)
 
     # Run ingest once
     job1 = Job(job_id=str(uuid.uuid4()), resource_id=resource_id, stage="ingest")
@@ -249,7 +249,7 @@ def test_url_dedup():
         source_url=url,
         status=ResourceStatus.SUBMITTED,
     )
-    container["resources"].save(resource1)
+    container["resources"].add(resource1)
 
     job1 = Job(job_id=str(uuid.uuid4()), resource_id=resource1.resource_id, stage="ingest")
     ingest_stage.run(job1)
@@ -263,7 +263,7 @@ def test_url_dedup():
         source_url=url,
         status=ResourceStatus.SUBMITTED,
     )
-    container["resources"].save(resource2)
+    container["resources"].add(resource2)
 
     job2 = Job(job_id=str(uuid.uuid4()), resource_id=resource2.resource_id, stage="ingest")
     ingest_stage.run(job2)

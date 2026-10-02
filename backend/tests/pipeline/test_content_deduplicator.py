@@ -296,7 +296,7 @@ class TestIsDuplicate:
             raw_object_key="raw/test",
             content_hash="a" * 64,
         )
-        fake_repo.save(resource)
+        fake_repo.add(resource)
 
         assert deduplicator.is_duplicate("a" * 64)
 
@@ -313,7 +313,7 @@ class TestIsDuplicate:
                 raw_object_key=f"raw/test{i}",
                 content_hash=f"{'a' * 63}{i}",
             )
-            fake_repo.save(resource)
+            fake_repo.add(resource)
 
         assert deduplicator.is_duplicate("a" * 63 + "0")
         assert deduplicator.is_duplicate("a" * 63 + "1")
@@ -350,7 +350,7 @@ class TestIntegration:
             raw_object_key="raw/doc1",
             content_hash=deduplicator.compute_hash(source_url=url, content=content),
         )
-        fake_repo.save(resource1)
+        fake_repo.add(resource1)
 
         # Check if duplicate
         content_hash = deduplicator.compute_hash(source_url=url, content=content)

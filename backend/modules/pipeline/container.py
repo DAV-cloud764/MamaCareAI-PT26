@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from .config import PipelineSettings
+from .domain.errors import InvalidStateTransition
 from .ports.deduplicator import Deduplicator
 from .ports.job_queue import JobQueue
 from .ports.language_detector import LanguageDetector
@@ -253,7 +254,22 @@ def build_test_container(**overrides: object) -> Container:
                 ),
                 None,
             )
-        def save(self, resource: ResourceRecord) -> None:
+        def save(self, resource: ResourceRecord, *, expected_status: object) -> None:
+            """Conditional update, matching the port and the real adapters.
+
+            In-memory, so "conditional" is a status comparison rather than a
+            WHERE clause. It is still worth having: a test double that accepts
+            a write the database would refuse is how a lost-update bug reaches
+            production behind a green suite.
+            """
+            existing = self.items.get(resource.resource_id)
+            if existing is not None and existing.status is not expected_status:
+                raise InvalidStateTransition(
+                    f"Concurrent modification of resource "
+                    f"{resource.resource_id!r}: expected "
+                    f"{getattr(expected_status, 'value', expected_status)}, found "
+                    f"{getattr(existing.status, 'value', existing.status)}."
+                )
             self.items[resource.resource_id] = resource
         def list_by_status(self, status: object, *, limit: int = 100, offset: int = 0) -> list[ResourceRecord]:
             return [

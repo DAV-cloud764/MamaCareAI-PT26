@@ -15,6 +15,10 @@ from backend.modules.pipeline.domain.enums import (
     SourceType,
     VersionAuthorKind,
 )
+from backend.modules.pipeline.domain.errors import (
+    InvalidStateTransition,
+    StaleVersionError,
+)
 from backend.modules.pipeline.domain.models import (
     ContentVersion,
     NormalizedDocument,
@@ -119,7 +123,7 @@ def test_edit_creates_a_new_version_and_preserves_the_machine_output() -> None:
     machine_version = versions.get_machine_version("r1")
     assert machine_version is not None
     original = asdict(machine_version)
-    created = service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits())
+    created = service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits(), base_version_number=1)
     history = versions.list_versions("r1")
     assert created.version_number == 2
     assert [v.version_number for v in history] == [1, 2]
@@ -128,14 +132,26 @@ def test_edit_creates_a_new_version_and_preserves_the_machine_output() -> None:
 
 def test_second_edit_creates_version_3() -> None:
     service, _, _, versions, _, _, review = _build()
-    service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits("first"))
+    service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits("first"), base_version_number=1)
     service.submit_decision(assignment_id=review.assignment_id, reviewer_id="reviewer-1", decision=ReviewDecision.NEEDS_EDIT, note="More changes")
-    created = service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits("second"))
+    created = service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits("second"), base_version_number=2)
     assert created.version_number == 3
     assert [v.version_number for v in versions.list_versions("r1")] == [1, 2, 3]
 
 
 def test_concurrent_edits_do_not_collide_on_version_number() -> None:
+    """Two reviewers editing the same version at once: one lands, one is refused.
+
+    This test used to assert that BOTH concurrent edits succeeded with distinct
+    version numbers, and to read that as the guarantee. It is the opposite — it
+    is the blind-update behaviour the persistence layer is supposed to prevent.
+    With both writes landing, the second edit silently discards the first, and
+    because versions are append-only, nothing downstream would ever reveal it:
+    both versions exist, both are readable, and the wrong one is the latest.
+
+    The version-number concern that gave the test its name still holds, so it is
+    still asserted. There is simply one human version now instead of two.
+    """
     resources = ConcurrentReadResourceRepository()
     reviews, versions = ReviewRepo(), VersionRepo()
     resources.add(_resource("r1", ResourceStatus.NEEDS_EDIT))
@@ -152,14 +168,117 @@ def test_concurrent_edits_do_not_collide_on_version_number() -> None:
         queue=FakeJobQueue(),
     )
 
-    def submit(item: ReviewAssignment) -> ContentVersion:
+    def submit(item: ReviewAssignment) -> str:
         assert item.reviewer_id
-        return service.submit_edit(assignment_id=item.assignment_id, reviewer_id=item.reviewer_id, edited_units=_edits(item.reviewer_id))
+        try:
+            service.submit_edit(
+                assignment_id=item.assignment_id,
+                reviewer_id=item.reviewer_id,
+                edited_units=_edits(item.reviewer_id),
+                base_version_number=1,
+            )
+        except (InvalidStateTransition, StaleVersionError):
+            return "refused"
+        return "accepted"
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        created = list(pool.map(submit, (first, second)))
-    assert len({v.version_number for v in created}) == 2
-    assert [v.version_number for v in versions.list_versions("r1")] == [1, 2, 3]
+        outcomes = list(pool.map(submit, (first, second)))
+
+    # Both reviewers loaded version 1. Whichever error the loser hits depends on
+    # the interleaving: `StaleVersionError` if the winner's version landed before
+    # the loser's pre-check, `InvalidStateTransition` if the loser's resource
+    # claim came second. Both are 409 to the reviewer and both refuse the write.
+    assert sorted(outcomes) == ["accepted", "refused"]
+    assert [v.version_number for v in versions.list_versions("r1")] == [1, 2]
+
+
+def test_a_stale_base_version_is_refused_before_anything_is_written() -> None:
+    """The reviewer's tab went stale; nothing is touched.
+
+    This is the common case, not an edge case: two reviewers on one document,
+    or one reviewer with two tabs. The refusal has to happen BEFORE the resource
+    transition, otherwise the resource is left mid-flow and their reload shows a
+    document stuck rather than one that simply moved on.
+    """
+    service, resources, _reviews, versions, _docs, _queue, review = _build()
+    # A second reviewer already landed an edit while this tab was open.
+    service.submit_edit(
+        assignment_id=review.assignment_id,
+        reviewer_id="reviewer-1",
+        edited_units=_edits("first"),
+        base_version_number=1,
+    )
+    assert versions.get_latest("r1").version_number == 2
+    resources.save(
+        resources.get("r1").with_status(ResourceStatus.NEEDS_EDIT),
+        expected_status=ResourceStatus.EDITED,
+    )
+
+    with pytest.raises(StaleVersionError) as caught:
+        service.submit_edit(
+            assignment_id=review.assignment_id,
+            reviewer_id="reviewer-1",
+            edited_units=_edits("stale"),
+            base_version_number=1,
+        )
+
+    assert caught.value.base_version_number == 1
+    assert caught.value.current_version_number == 2
+    # Nothing appended, and the resource is where it was.
+    assert [v.version_number for v in versions.list_versions("r1")] == [1, 2]
+    assert resources.get("r1").status is ResourceStatus.NEEDS_EDIT
+
+
+def test_approval_pins_which_version_was_approved() -> None:
+    """Publishing "whatever is newest" is not the same as publishing what was approved.
+
+    The pin has to record the version id, because the number alone is not enough
+    to distinguish two different documents' histories if the id is ever reused
+    across a re-import.
+    """
+    service, resources, _reviews, versions, _docs, _queue, review = _build()
+    service.submit_edit(
+        assignment_id=review.assignment_id,
+        reviewer_id="reviewer-1",
+        edited_units=_edits("human"),
+        base_version_number=1,
+    )
+    approved = versions.get_latest("r1")
+    assert approved is not None
+
+    service.submit_decision(
+        assignment_id=review.assignment_id,
+        reviewer_id="reviewer-1",
+        decision=ReviewDecision.APPROVE,
+    )
+
+    metadata = resources.get("r1").source_metadata
+    assert metadata["approved_by"] == "reviewer-1"
+    assert metadata["approved_version_id"] == approved.version_id
+    assert metadata["approved_version_number"] == 2
+
+
+def test_approving_with_no_content_version_is_refused() -> None:
+    """Approval pins a version; without one there is nothing to authorise."""
+    resources, reviews, versions = FakeResourceRepository(), ReviewRepo(), VersionRepo()
+    # IN_REVIEW, because STORED -> APPROVED is not a legal arrow.
+    resources.add(_resource("r1", ResourceStatus.IN_REVIEW))
+    review = _assignment("r1")
+    reviews.create_assignment(review)
+    service = ReviewService(
+        resources=resources,
+        reviews=reviews,
+        versions=versions,
+        documents=FakeDocumentRepository(),
+        queue=FakeJobQueue(),
+    )
+
+    with pytest.raises(ValueError, match="no content version"):
+        service.submit_decision(
+            assignment_id=review.assignment_id,
+            reviewer_id="reviewer-1",
+            decision=ReviewDecision.APPROVE,
+        )
 
 
 def test_claim_next_returns_highest_priority_first() -> None:
@@ -225,7 +344,7 @@ def test_every_action_writes_an_audit_event(action: str) -> None:
     if action == "claim":
         service.claim_next("reviewer-1")
     elif action == "edit":
-        service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits())
+        service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits(), base_version_number=1)
     else:
         service.submit_decision(assignment_id=review.assignment_id, reviewer_id="reviewer-1", decision=ReviewDecision.APPROVE)
     events = reviews.list_audit("r1")
@@ -237,7 +356,7 @@ def test_audit_trail_is_ordered_and_complete() -> None:
     service, _, reviews, _, _, _, review = _build(ResourceStatus.STORED, None)
     service.claim_next("reviewer-1")
     service.submit_decision(assignment_id=review.assignment_id, reviewer_id="reviewer-1", decision=ReviewDecision.NEEDS_EDIT, note="Correct it")
-    service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits())
+    service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits(), base_version_number=1)
     service.submit_decision(assignment_id=review.assignment_id, reviewer_id="reviewer-1", decision=ReviewDecision.APPROVE)
     events = reviews.list_audit("r1")
     assert [e.action for e in events] == ["claim", "needs_edit", "edit", "approve"]
@@ -263,7 +382,7 @@ def test_payload_aligns_source_and_translation_by_order() -> None:
 def test_payload_includes_the_machine_version_after_a_human_edit() -> None:
     service, _, _, _, documents, _, review = _build()
     _save_document(documents)
-    service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits())
+    service.submit_edit(assignment_id=review.assignment_id, reviewer_id="reviewer-1", edited_units=_edits(), base_version_number=1)
     payload = service.get_review_payload("r1")
     translation_units = cast(tuple[TranslationUnit, ...], payload["translation_units"])
     assert [u.translated_text for u in translation_units] == ["human-0", "human-1"]

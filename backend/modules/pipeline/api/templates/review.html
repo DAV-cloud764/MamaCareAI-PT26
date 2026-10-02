@@ -132,6 +132,7 @@
         const resource = document.querySelector("#resource-id");
         const version = document.querySelector("#version");
         let assignmentId = "";
+        let loadedVersionNumber = null;
 
         const requestError = (detail, fallback) => {
           if (typeof detail === "string") return detail;
@@ -237,6 +238,7 @@
           engine.hidden = !payload.engine;
           resource.textContent = `Resource: ${payload.resource_id}`;
           version.textContent = `Version ${payload.version_number}`;
+          loadedVersionNumber = payload.version_number;
           version.hidden = false;
           metadata.hidden = false;
           noteField.value = "";
@@ -278,6 +280,10 @@
           if (!form.reportValidity()) return;
           if (!assignmentId) {
             showSaveStatus("No review assignment is loaded.", "error");
+            return;
+          }
+          if (loadedVersionNumber === null) {
+            showSaveStatus("No version is loaded. Reload the review and try again.", "error");
             return;
           }
 
@@ -326,7 +332,11 @@
               method: "POST",
               credentials: "same-origin",
               headers: { Accept: "application/json", "Content-Type": "application/json" },
-              body: JSON.stringify({ units, note: note || null }),
+              body: JSON.stringify({
+                units,
+                base_version_number: loadedVersionNumber,
+                note: note || null,
+              }),
             });
             const result = await readJson(response);
             if (!response.ok) {

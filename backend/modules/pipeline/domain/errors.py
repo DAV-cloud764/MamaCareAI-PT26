@@ -130,3 +130,38 @@ class ComplianceBlocked(PermanentError):
     Terminal by design: content we do not have the right to republish must
     never reach the published index, no matter how good the translation is.
     """
+
+
+class ResourceNotFound(PermanentError):
+    """A row was requested by id and does not exist.
+
+    Distinct from a bare `PermanentError` so the API layer can answer 404
+    without also answering 404 for a malformed request or an unsupported
+    format. Both are permanent, but only one of them is a missing thing.
+    """
+
+
+class StaleVersionError(PermanentError):
+    """A write was based on a version that is no longer the current one.
+
+    Raised by `VersionRepository.save_version_if_current` when the caller's
+    `base_version_number` is behind the stored state. Not retryable, because
+    retrying the identical write loses the same edit: the reviewer has to
+    reload, see what changed, and decide again.
+
+    Carries both numbers so the API layer can tell the reviewer exactly how far
+    behind they are, and so the audit trail records the collision rather than
+    just the refusal.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        resource_id: str | None = None,
+        base_version_number: int | None = None,
+        current_version_number: int | None = None,
+    ) -> None:
+        super().__init__(message, resource_id=resource_id)
+        self.base_version_number = base_version_number
+        self.current_version_number = current_version_number

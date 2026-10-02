@@ -23,8 +23,10 @@ processing to human judgement.
 
 from __future__ import annotations
 
-from ..domain.enums import ResourceStatus
-from ..domain.models import Resource
+import uuid
+
+from ..domain.enums import ResourceStatus, VersionAuthorKind
+from ..domain.models import ContentVersion, Resource, TranslationUnit
 from ..observability.metrics import Metrics
 from ..ports.job_queue import JobQueue
 from ..ports.repositories import (
@@ -33,12 +35,13 @@ from ..ports.repositories import (
     ReviewRepository,
     VersionRepository,
 )
-from ..ports.search_index import IndexedResource, SearchIndex
+from ..ports.search_index import SearchIndex
+from ..services.review_service import ReviewService
 from .base import Stage, StageResult
 
 
 class StoreStage(Stage):
-    """Indexes translated content and opens a human review task."""
+    """Opens a human review task for a translated or native-Swahili resource."""
 
     def __init__(
         self,
@@ -49,7 +52,7 @@ class StoreStage(Stage):
         documents: DocumentRepository,
         versions: VersionRepository,
         search: SearchIndex,
-        review_service: object,  # TODO: type as services.review_service.ReviewService
+        review_service: ReviewService,
         max_attempts: int = 5,
         metrics: Metrics | None = None,
     ) -> None:
@@ -72,37 +75,30 @@ class StoreStage(Stage):
         return frozenset({ResourceStatus.TRANSLATED, ResourceStatus.LANGUAGE_DETECTED})
 
     def handle(self, resource: Resource) -> StageResult:
-        """Index the content and create the review assignment.
+        """Open a reviewable version and hand the document to a human.
 
-        Two paths, both must index:
-          - the resource has a machine translation (normal path): index the
-            latest version's translated text;
-          - it is already-Swahili (skipped translation): index the extracted
-            document directly. Forgetting this case silently makes
-            Swahili-native sources unsearchable while everything else works.
+        Nothing is indexed here. This stage used to write the translation into
+        the search index, and `ReviewService` re-indexed on every edit, so
+        unapproved content reached the production index twice before any human
+        had looked at it. `PublishStage` is now the only writer to that index,
+        which is the only way "nothing unapproved is published" is true rather
+        than merely intended. The review queue reads from the repository
+        (`list_by_status`), so removing this costs the reviewers nothing.
+
+        Two paths, and both must produce a version:
+
+          - a resource that went through translation already has one; the
+            reviewer's job is to check and correct the machine output;
+          - a native-Swahili source skipped translation entirely, so there is
+            nothing to compare against and nothing for the review UI to align.
+            It gets a version built from the extracted blocks, with the source
+            text as its own translation. The reviewer sees the same side-by-side
+            layout as every other document instead of an empty pane, and their
+            edits diff against the original the same way a machine version does.
         """
         version = self._versions.get_latest(resource.resource_id)
-        if version is not None:
-            translated_text = self._units_to_text(version.units)
-            version_number = version.version_number
-            title = resource.source_metadata.get("title")
-        else:
-            document = self._documents.get_document(resource.resource_id)
-            translated_text = "\n\n".join(block.text for block in document.blocks)
-            version_number = 0
-            title = document.title
-
-        self._search.index(
-            IndexedResource(
-                resource_id=resource.resource_id,
-                title=title,
-                translated_text=translated_text,
-                source_url=resource.source_url,
-                status=ResourceStatus.STORED.value,
-                version_number=version_number,
-                metadata={"language": resource.detected_language or ""},
-            )
-        )
+        if version is None:
+            version = self._source_version(resource)
 
         self._review_service.enqueue_for_review(resource, version)
 
@@ -111,7 +107,31 @@ class StoreStage(Stage):
             next_stage="review",
         )
 
-    @staticmethod
-    def _units_to_text(units) -> str:
-        """Flatten translation units into the searchable plain-text projection."""
-        return "\n\n".join(unit.translated_text for unit in units)
+    def _source_version(self, resource: Resource) -> ContentVersion:
+        """Build version 1 for content that is already Swahili.
+
+        Without this, a native-Swahili resource has no version at all: the old
+        code built a flattened string inline and indexed it, so nothing
+        reviewable was ever persisted. A reviewer opening it got an empty right
+        pane and no way to record what they checked.
+        """
+        document = self._documents.get_document(resource.resource_id)
+        return ContentVersion(
+            version_id=str(uuid.uuid4()),
+            resource_id=resource.resource_id,
+            version_number=1,
+            author_kind=VersionAuthorKind.MACHINE,
+            author_id=None,
+            units=tuple(
+                TranslationUnit(
+                    order=block.order,
+                    source_text=block.text,
+                    translated_text=block.text,
+                    kind=block.kind,
+                    confidence=None,
+                )
+                for block in document.blocks
+            ),
+            engine="source:already-target-language",
+            note="Source was already Swahili; no machine translation was needed.",
+        )
