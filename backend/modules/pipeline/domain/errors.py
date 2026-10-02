@@ -132,6 +132,15 @@ class ComplianceBlocked(PermanentError):
     """
 
 
+class ResourceNotFound(PermanentError):
+    """A row was requested by id and does not exist.
+
+    Distinct from a bare `PermanentError` so the API layer can answer 404
+    without also answering 404 for a malformed request or an unsupported
+    format. Both are permanent, but only one of them is a missing thing.
+    """
+
+
 class StaleVersionError(PermanentError):
     """A write was based on a version that is no longer the current one.
 

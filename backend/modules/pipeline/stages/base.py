@@ -226,7 +226,9 @@ class Stage(ABC):
                         last_error=str(exc),
                         attempt_count=resource.attempt_count + 1,
                     )
-                    self._resources.save(failed_resource)
+                    self._resources.save(
+                        failed_resource, expected_status=resource.status
+                    )
                     self._queue.send_to_dead_letter(job, reason=str(exc))
                     self._metrics.increment(
                         MetricNames.JOBS_PROCESSED,
@@ -245,7 +247,9 @@ class Stage(ABC):
                     last_error=f"Unexpected error: {exc}",
                     attempt_count=resource.attempt_count + 1,
                 )
-                self._resources.save(failed_resource)
+                self._resources.save(
+                    failed_resource, expected_status=resource.status
+                )
                 self._queue.send_to_dead_letter(job, reason=f"Unexpected error: {exc}")
                 self._metrics.increment(
                     MetricNames.JOBS_PROCESSED,
@@ -257,12 +261,15 @@ class Stage(ABC):
             assert_can_transition(resource.status, result.next_status)
 
             # 5. PERSIST
+            # `expected_status` is the status we loaded, not the one we are
+            # about to write. That is what makes the write conditional, and
+            # therefore what makes a lost update detectable at all.
             updated = resource.with_status(
                 result.next_status,
                 attempt_count=resource.attempt_count + 1,
                 **result.resource_changes,
             )
-            self._resources.save(updated)
+            self._resources.save(updated, expected_status=resource.status)
 
             # 6. AUDIT
             audit_event = AuditEvent(

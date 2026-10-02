@@ -18,6 +18,7 @@ from backend.modules.pipeline.domain.enums import (
 from backend.modules.pipeline.domain.errors import (
     ExtractionError,
     FetchError,
+    InvalidStateTransition,
     StaleVersionError,
     UnsupportedSourceType,
 )
@@ -81,21 +82,27 @@ class FakeResourceRepository(ResourceRepository):
         """Dedup lookup - return None when the hash is new."""
         return self._content_hashes.get(content_hash)
 
-    def save(self, resource: Resource) -> None:
-        """Simulate conditional update - raises if version mismatch."""
-        current_version = self._versions.get(resource.resource_id, 0)
-        expected_version = current_version + 1
+    def save(self, resource: Resource, *, expected_status: ResourceStatus) -> None:
+        """Conditional update on `expected_status`, mirroring the SQL adapter.
 
-        # Simulate race condition: if resource was already updated, raise
-        if resource.resource_id in self._resources:
-            existing = self._resources[resource.resource_id]
-            if existing.updated_at != resource.updated_at:
-                # This is a simplified check - in real scenario would use version numbers
-                # For fake, we just allow the save if the resource_id exists
-                pass
-
+        This used to claim to simulate a conditional update and then not check
+        anything — the comparison branch was an empty `pass`. A fake that is
+        more permissive than the real implementation is worse than no fake: the
+        tests using it pass while the adapter loses updates. It now raises on a
+        status mismatch, so a lost update fails here too.
+        """
+        existing = self._resources.get(resource.resource_id)
+        if existing is not None and existing.status is not expected_status:
+            raise InvalidStateTransition(
+                f"Concurrent modification of resource {resource.resource_id!r}: "
+                f"expected status {expected_status.value}, found "
+                f"{existing.status.value}.",
+                resource_id=resource.resource_id,
+            )
         self._resources[resource.resource_id] = resource
-        self._versions[resource.resource_id] = expected_version
+        self._versions[resource.resource_id] = self._versions.get(
+            resource.resource_id, 0
+        ) + 1
         if resource.content_hash:
             self._content_hashes[resource.content_hash] = resource
 

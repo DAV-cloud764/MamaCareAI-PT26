@@ -371,7 +371,9 @@ def _retry_failed_resources(
             reset = resource.with_status(  # type: ignore[attr-defined]
                 ResourceStatus.SUBMITTED, attempt_count=0, last_error=None
             )
-            resources.save(reset)  # type: ignore[attr-defined]
+            resources.save(  # type: ignore[attr-defined]
+                reset, expected_status=resource.status
+            )
             queue.publish(  # type: ignore[attr-defined]
                 Job(
                     job_id=str(uuid.uuid4()),

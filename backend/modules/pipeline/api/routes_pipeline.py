@@ -33,10 +33,9 @@ from fastapi import (
 )
 
 from ..adapters.storage.keys import build_raw_key
-from ..adapters.storage.sql_repositories import ResourceNotFoundError
 from ..container import Container
 from ..domain.enums import ResourceStatus, SourceType
-from ..domain.errors import PermanentError
+from ..domain.errors import PermanentError, ResourceNotFound
 from ..domain.models import Job, Resource
 from ..services.submission import SubmissionService
 from .schemas import (
@@ -302,28 +301,28 @@ def list_resources(
    response_model=ResourceStatusResponse,
 )
 def get_resource_status(
-   resource_id: str,
-   container: Annotated[Container, Depends(get_container)],
+    resource_id: str,
+    container: Annotated[Container, Depends(get_container)],
 ) -> ResourceStatusResponse:
-   try:
-       resource = container.resources.get(resource_id)
-   except ResourceNotFoundError as exc:
-       raise HTTPException(
-           status_code=status.HTTP_404_NOT_FOUND,
-           detail="Resource not found",
-       ) from exc
+    try:
+        resource = container.resources.get(resource_id)
+    except ResourceNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Resource not found",
+        ) from exc
 
-   current_version = container.versions.get_latest(resource_id)
+    current_version = container.versions.get_latest(resource_id)
 
-   return ResourceStatusResponse(
-       resource_id=resource.resource_id,
-       source_url=resource.source_url,
-       source_type=resource.source_type,
-       status=resource.status,
-       detected_language=resource.detected_language,
-       language_confidence=resource.language_confidence,
-       submitted_at=resource.submitted_at,
-       updated_at=resource.updated_at,
+    return ResourceStatusResponse(
+        resource_id=resource.resource_id,
+        source_url=resource.source_url,
+        source_type=resource.source_type,
+        status=resource.status,
+        detected_language=resource.detected_language,
+        language_confidence=resource.language_confidence,
+        submitted_at=resource.submitted_at,
+        updated_at=resource.updated_at,
        current_version=current_version.version_number if current_version is not None else None,
        error=resource.last_error,
    )
