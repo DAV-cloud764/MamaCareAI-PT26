@@ -7,6 +7,10 @@ from modules.pipeline.api.routes_pipeline import router
 from modules.pipeline.container import build_test_container
 from modules.pipeline.domain.enums import ResourceStatus, SourceType
 from modules.pipeline.domain.models import Resource
+from modules.pipeline.api.routes_pipeline import (
+    require_pipeline_api_key,
+    router,
+)
 
 
 def create_test_app():
@@ -206,6 +210,15 @@ def test_list_resources_rejects_invalid_pagination():
    )
    assert response.status_code == 422
 
+def create_test_app():
+    app = FastAPI()
+    container = build_test_container()
+
+    app.state.container = container
+    app.dependency_overrides[require_pipeline_api_key] = lambda: None
+    app.include_router(router)
+
+    return app, container
 
 def test_get_stats_returns_queue_and_status_counts():
    app, container = create_test_app()
